@@ -1,0 +1,14 @@
+{
+    "folders": [
+		{
+			"path": "../.."
+		},
+		{
+			"name": "My_Project",
+			"path": "../../My_Project"
+		}
+	],
+    "settings": {
+        "C_Cpp.intelliSenseEngine": "disabled"
+    }
+}
