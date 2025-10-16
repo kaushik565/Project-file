@@ -16,7 +16,7 @@ This integration implements the required handshaking to prevent SBC errors.
 
 import logging
 import time
-import threading
+from pathlib import Path
 from typing import Optional
 
 from hardware import get_hardware_controller
@@ -243,10 +243,24 @@ def get_legacy_integration() -> ACTJLegacyIntegration:
 def is_legacy_mode() -> bool:
     """Check if running in ACTJv20(RJSR) legacy mode."""
     try:
-        from config import SETTINGS_FILE
-        return "legacy" in SETTINGS_FILE.lower()
-    except:
+        from config import CONFIG_FILE, HEADER_TEXT, APP_TITLE
+    except Exception:
         return False
+
+    # Primary detection: look for "legacy" markers in the active settings file
+    try:
+        config_path = Path(CONFIG_FILE)
+        if config_path.exists():
+            contents = config_path.read_text(encoding="utf-8", errors="ignore").lower()
+            if "legacy mode" in contents or "legacy hardware" in contents:
+                return True
+    except Exception:
+        # Fall back to UI strings if file cannot be inspected
+        pass
+
+    header = (HEADER_TEXT or "").upper()
+    title = (APP_TITLE or "").upper()
+    return "LEGACY" in header or "LEGACY" in title
 
 
 if __name__ == "__main__":
