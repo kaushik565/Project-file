@@ -46,6 +46,7 @@ class ACTJv20UARTProtocol:
         
         # QR validation callback
         self.qr_validator = None
+        self._scan_request_callback = None
         
         # QR input handling
         self._waiting_for_qr = False
@@ -123,7 +124,7 @@ class ACTJv20UARTProtocol:
                 self.logger.info(f"ACTJv20 scan command: {full_command}")
                 
                 if full_command in ['20', '19']:  # Scan commands
-                    self._handle_scan_command()
+                    self._handle_scan_command(full_command == '19')
                 elif full_command == '10':  # Some other command
                     self.logger.debug("ACTJv20 command 10 received")
                     
@@ -134,28 +135,36 @@ class ACTJv20UARTProtocol:
             self.logger.info("ACTJv20 stop command received")
             self._handle_stop_command()
     
-    def _handle_scan_command(self):
+    def _handle_scan_command(self, final_attempt: bool = False):
         """Handle QR scan command from ACTJv20."""
         try:
             # Signal busy to firmware (RASP_IN_PIC LOW)
             self.hardware.signal_busy_to_firmware()
             self.logger.info("ACTJv20 scan command - signaling BUSY, waiting for QR input")
-            
+
             # Set a flag that we're waiting for QR input
             self._waiting_for_qr = True
             self._scan_start_time = time.time()
-            
+
+            # Notify the application so it can prepare the UI for scanning
+            if self._scan_request_callback:
+                try:
+                    self._scan_request_callback(final_attempt)
+                except Exception as callback_exc:
+                    self.logger.error(f"Scan request callback error: {callback_exc}")
+
             # The USB QR scanner will trigger _process_qr_input when QR is scanned
             # For now, we'll wait up to 30 seconds for QR input
             timeout = 30.0
             while self._waiting_for_qr and (time.time() - self._scan_start_time) < timeout:
                 time.sleep(0.1)
-            
+
             if self._waiting_for_qr:
                 # Timeout - send scanner error
                 self.logger.warning("QR scan timeout - sending scanner error")
                 self.serial_port.write(b'S')  # Scanner error
-            
+                self._waiting_for_qr = False
+
             # Always signal ready at the end
             time.sleep(0.1)
             self.hardware.signal_ready_to_firmware()
@@ -167,6 +176,7 @@ class ACTJv20UARTProtocol:
             try:
                 self.serial_port.write(b'S')  # Scanner error
                 self.hardware.signal_ready_to_firmware()
+                self._waiting_for_qr = False
             except:
                 pass
     
@@ -238,6 +248,15 @@ class ACTJv20UARTProtocol:
         """Handle stop command from ACTJv20."""
         self.logger.info("ACTJv20 stop command - setting ready state")
         self.hardware.signal_ready_to_firmware()
+
+    def set_scan_request_callback(self, callback):
+        """Register callback invoked when firmware requests a scan."""
+        self._scan_request_callback = callback
+
+    @property
+    def is_waiting_for_qr(self) -> bool:
+        """Expose whether the protocol is currently waiting for QR input."""
+        return self._waiting_for_qr
 
 
 # Integration with existing legacy system
