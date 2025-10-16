@@ -1713,42 +1713,6 @@ class BatchScannerApp:
         logger = logging.getLogger("qr.scan")
         logger.info(f"Processing QR from USB/manual input: {qr_code}")
 
-        # ACTJv20(RJSR) Legacy Integration - Process QR via UART protocol
-        if self.legacy_mode and self.legacy_uart_protocol and hasattr(self.legacy_uart_protocol, 'process_qr_input'):
-            self.legacy_uart_protocol.process_qr_input(qr_code)
-            logger.info(f"QR sent to ACTJv20 UART protocol: {qr_code}")
-
-            status, mould = handle_qr_scan(
-                qr_code,
-                self.batch_line,
-                self.mould_ranges,
-                duplicate_checker=lambda code: self._check_duplicate(code),
-            )
-
-            if status == "PASS":
-                self.counters["accepted"] += 1
-                self.duplicate_tracker.record_scan(self.batch_number, qr_code)
-                logger.info(f"QR accepted: {qr_code} -> {mould}")
-            elif status == "DUPLICATE":
-                self.counters["duplicate"] += 1
-                logger.warning(f"QR duplicate: {qr_code}")
-            else:
-                self.counters["rejected"] += 1
-                logger.warning(f"QR rejected ({status}): {qr_code}")
-
-            self.counters["total"] += 1
-            self._update_scan_display(qr_code, status, mould)
-
-            if self.csv_writer and self.log_file:
-                write_log(self.csv_writer, self.log_file, self.batch_number, mould, qr_code, status)
-
-            if hasattr(self, '_manual_scan_timeout_id') and self._manual_scan_timeout_id:
-                self.window.after_cancel(self._manual_scan_timeout_id)
-                self._manual_scan_timeout_id = None
-
-            self.awaiting_hardware = False
-            return
-
         # Cancel manual scan timeout since we got input
         if hasattr(self, '_manual_scan_timeout_id') and self._manual_scan_timeout_id:
             self.window.after_cancel(self._manual_scan_timeout_id)
@@ -1760,6 +1724,22 @@ class BatchScannerApp:
             self.mould_ranges,
             duplicate_checker=lambda code: self._check_duplicate(code),
         )
+
+        if (
+            self.legacy_mode
+            and legacy_waiting
+            and self.legacy_uart_protocol
+            and hasattr(self.legacy_uart_protocol, "process_qr_input")
+        ):
+            try:
+                self.legacy_uart_protocol.process_qr_input(
+                    qr_code, validation_result=(status, mould)
+                )
+                logger.info("QR result sent to ACTJv20 UART protocol: %s", qr_code)
+            except Exception as exc:
+                logging.getLogger("actj.legacy").error(
+                    "Failed to send QR result to ACTJv20 firmware: %s", exc
+                )
 
         if status == "PASS":
             self.counters["accepted"] += 1
@@ -1777,6 +1757,8 @@ class BatchScannerApp:
 
         if self.csv_writer and self.log_file:
             write_log(self.csv_writer, self.log_file, self.batch_number, mould, qr_code, status)
+
+        self.awaiting_hardware = False
 
         # Send result to firmware - this allows it to set diverter and continue cycle
         self._complete_controller_request(status)

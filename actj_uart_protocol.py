@@ -24,10 +24,16 @@ The ACTJv20 firmware expects BOTH GPIO handshaking AND UART communication:
 """
 
 import logging
-import serial
 import time
 import threading
-from typing import Optional
+from typing import Optional, Tuple
+
+try:  # Optional dependency in development environments
+    import serial  # type: ignore
+    from serial import SerialException  # type: ignore
+except Exception:  # pragma: no cover - pyserial not installed
+    serial = None  # type: ignore
+    SerialException = Exception  # type: ignore
 
 from hardware import get_hardware_controller
 
@@ -38,7 +44,7 @@ class ACTJv20UARTProtocol:
     def __init__(self, port="/dev/serial0", baudrate=115200):
         self.logger = logging.getLogger("actj_uart")
         self.hardware = get_hardware_controller()
-        self.serial_port = None
+        self.serial_port: Optional[serial.Serial] = None  # type: ignore[name-defined]
         self.port = port
         self.baudrate = baudrate
         self.running = False
@@ -54,6 +60,10 @@ class ACTJv20UARTProtocol:
         
     def connect(self):
         """Connect to ACTJv20 UART port."""
+        if serial is None:
+            self.logger.error("pyserial not installed - cannot open ACTJv20 UART port")
+            return False
+
         try:
             self.serial_port = serial.Serial(
                 port=self.port,
@@ -65,10 +75,10 @@ class ACTJv20UARTProtocol:
             )
             self.logger.info(f"Connected to ACTJv20 on {self.port}")
             return True
-        except Exception as e:
+        except SerialException as e:  # type: ignore[name-defined]
             self.logger.error(f"Failed to connect to ACTJv20: {e}")
             return False
-    
+
     def set_qr_validator(self, validator_func):
         """Set QR validation function that returns ('PASS'/'FAIL', mould)."""
         self.qr_validator = validator_func
@@ -99,42 +109,42 @@ class ACTJv20UARTProtocol:
         """Main listening loop for ACTJv20 commands."""
         while self.running:
             try:
-                if self.serial_port and self.serial_port.in_waiting > 0:
-                    # Read command from ACTJv20
+                if self.serial_port and getattr(self.serial_port, "in_waiting", 0):
                     data = self.serial_port.read(1)
-                    if data:
-                        command = data.decode('ascii', errors='ignore')
-                        self.logger.debug(f"Received ACTJv20 command: {repr(command)}")
-                        self._handle_command(command)
-                
+                    if not data:
+                        continue
+
+                    command = data[0]
+                    self.logger.debug(
+                        "Received ACTJv20 command byte: 0x%02X", command
+                    )
+                    self._handle_command(command)
+
                 time.sleep(0.01)  # Small delay to prevent busy loop
-                
+
             except Exception as e:
                 self.logger.error(f"Error in ACTJv20 listen loop: {e}")
                 time.sleep(0.1)
-    
-    def _handle_command(self, command):
+
+    def _handle_command(self, command: int) -> None:
         """Handle command from ACTJv20 firmware."""
-        if command in ['2', '1', '0']:  # Commands 20, 19, 10, etc. come as individual chars
-            # This is likely a scan command (20 = '2' + '0')
-            # We need to read the next character to get the full command
-            try:
-                next_char = self.serial_port.read(1).decode('ascii', errors='ignore')
-                full_command = command + next_char
-                self.logger.info(f"ACTJv20 scan command: {full_command}")
-                
-                if full_command in ['20', '19']:  # Scan commands
-                    self._handle_scan_command(full_command == '19')
-                elif full_command == '10':  # Some other command
-                    self.logger.debug("ACTJv20 command 10 received")
-                    
-            except Exception as e:
-                self.logger.error(f"Error reading full command: {e}")
-        
-        elif command == '0':  # Stop command
+        if command == 20:  # Start scan (with retry allowed)
+            self.logger.info("ACTJv20 scan command received (retry allowed)")
+            self._handle_scan_command(final_attempt=False)
+        elif command == 19:  # Final scan attempt
+            self.logger.info("ACTJv20 scan command received (final attempt)")
+            self._handle_scan_command(final_attempt=True)
+        elif command == 0:  # Stop command / end of recording
             self.logger.info("ACTJv20 stop command received")
             self._handle_stop_command()
-    
+        elif command == 23:  # Start recording request
+            self.logger.debug("ACTJv20 start recording command received")
+            self.hardware.signal_ready_to_firmware()
+        elif command == 24:  # Bluetooth pairing or auxiliary command
+            self.logger.debug("ACTJv20 auxiliary command 24 received")
+        else:
+            self.logger.debug("Unknown ACTJv20 command byte: %s", command)
+
     def _handle_scan_command(self, final_attempt: bool = False):
         """Handle QR scan command from ACTJv20."""
         try:
@@ -180,70 +190,93 @@ class ACTJv20UARTProtocol:
             except:
                 pass
     
-    def process_qr_input(self, qr_code):
-        """Process QR code input from USB scanner."""
+    def process_qr_input(
+        self,
+        qr_code: str,
+        validation_result: Optional[Tuple[str, Optional[str]]] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Process QR code input from USB scanner and respond to firmware."""
         if not self._waiting_for_qr:
             self.logger.debug(f"Received QR {qr_code} but not waiting for input")
-            return
-        
+            return None, None
+
         try:
             self.logger.info(f"Processing QR code: {qr_code}")
-            
+
             # Use the QR validator to check the code
-            if self.qr_validator:
+            if validation_result is not None:
+                status, mould = validation_result
+            elif self.qr_validator:
                 status, mould = self.qr_validator(qr_code)
-                
-                if status == "PASS":
-                    response = 'A'  # Accept
-                    self.logger.info(f"QR validation PASSED ({mould}) - sending Accept")
-                else:
-                    response = 'R'  # Reject  
-                    self.logger.info(f"QR validation FAILED ({status}) - sending Reject")
             else:
-                response = 'A'  # Default to accept if no validator
-                self.logger.warning("No QR validator set - defaulting to Accept")
-            
+                status, mould = "PASS", None
+                self.logger.warning("No QR validator set - defaulting to PASS")
+
+            response = self._map_status_to_response(status)
+            if response == 'A':
+                self.logger.info(
+                    "QR validation PASSED (%s) - sending Accept", mould or "UNKNOWN"
+                )
+            elif response == 'R':
+                self.logger.info(
+                    "QR validation FAILED (%s) - sending Reject", status
+                )
+            else:
+                self.logger.info("QR validation produced error (%s) - sending error", status)
+
             # Signal busy before sending response (critical for ACTJv20 timing)
             self.hardware.signal_busy_to_firmware()
             time.sleep(0.1)  # Brief delay for firmware to register busy state
-            
+
             # Send response to ACTJv20
+            if not self.serial_port:
+                raise RuntimeError("UART port is not connected")
+
             self.serial_port.write(response.encode('ascii'))
+            if hasattr(self.serial_port, "flush"):
+                try:
+                    self.serial_port.flush()
+                except Exception:  # pragma: no cover - serial flush not critical
+                    pass
             self.logger.info(f"Sent response to ACTJv20: {response}")
-            
+
             # ALL responses need proper GPIO pulse sequence for mechanism plate movement
             time.sleep(0.15)  # Wait for firmware to process the UART response
-            
+
             if response == 'A':
                 # Accept: Standard pulse sequence for mechanism plate
                 self.hardware.signal_accept_pulse()
                 self.logger.info("Sent ACCEPT GPIO pulse sequence for mechanism plate")
-                
+
             elif response == 'R':
                 # Reject: Extended pulse sequence for rejection path
                 self.hardware.signal_rejection_pulse()  # Special rejection pulse sequence
                 self.logger.info("Sent REJECT GPIO pulse sequence for mechanism plate")
-                
+
             else:
                 # Scanner error: Basic ready signal
                 self.hardware.signal_ready_to_firmware()
                 self.logger.info("Sent ERROR GPIO signal")
-            
+
             # Final ready state after pulse sequence
             time.sleep(0.1)  # Allow mechanism to move
             self.hardware.signal_ready_to_firmware()
-            
+
             # Clear the waiting flag
             self._waiting_for_qr = False
-            
+
+            return status, mould
+
         except Exception as e:
             self.logger.error(f"Error processing QR input: {e}")
             try:
-                self.serial_port.write(b'S')  # Scanner error
+                if self.serial_port:
+                    self.serial_port.write(b'S')  # Scanner error
                 self._waiting_for_qr = False
             except:
                 pass
-    
+            return None, None
+
     def _handle_stop_command(self):
         """Handle stop command from ACTJv20."""
         self.logger.info("ACTJv20 stop command - setting ready state")
@@ -257,6 +290,24 @@ class ACTJv20UARTProtocol:
     def is_waiting_for_qr(self) -> bool:
         """Expose whether the protocol is currently waiting for QR input."""
         return self._waiting_for_qr
+
+    @staticmethod
+    def _map_status_to_response(status: Optional[str]) -> str:
+        """Translate validation status text to firmware response code."""
+        if status == "PASS":
+            return 'A'
+
+        if status in {
+            "DUPLICATE",
+            "INVALID FORMAT",
+            "LINE MISMATCH",
+            "OUT OF BATCH",
+            "REJECT",
+            "FAIL",
+        }:
+            return 'R'
+
+        return 'S'
 
 
 # Integration with existing legacy system
@@ -276,6 +327,11 @@ def start_actj_communication(qr_validator_func=None):
     protocol = get_uart_protocol()
     if qr_validator_func:
         protocol.set_qr_validator(qr_validator_func)
+    if serial is None:
+        protocol.logger.error(
+            "pyserial not installed - cannot start ACTJv20 UART communication"
+        )
+        return False
     return protocol.start_listening()
 
 
