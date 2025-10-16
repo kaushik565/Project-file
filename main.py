@@ -1860,6 +1860,16 @@ class BatchScannerApp:
             self.controller_link.close()
         if self.camera_scanner:
             self.camera_scanner.close()
+        # ACTJv20(RJSR) Legacy Integration - shutdown sequence
+        try:
+            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
+            if is_legacy_mode():
+                legacy = get_legacy_integration()
+                legacy.shutdown_sequence()
+        except ImportError:
+            pass  # Legacy integration not available
+        except Exception as exc:
+            logging.getLogger("actj.legacy").warning("ACTJv20 shutdown sequence failed: %s", exc)
         try:
             self.hardware.set_busy(False)
         except Exception:
@@ -1893,17 +1903,19 @@ def launch_app():
         logging.getLogger("startup").info("All busy/status lines asserted HIGH - PIC can proceed")
     except Exception as exc:
         logging.getLogger("startup").warning("Unable to assert busy lines on startup: %s", exc)
-    
-        # ACTJv20(RJSR) Legacy Integration - startup sequence
-        try:
-            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-            if is_legacy_mode():
-                legacy = get_legacy_integration()
-                legacy.startup_sequence()
-                logging.getLogger("startup").info("ACTJv20(RJSR) legacy startup sequence completed")
-                logging.getLogger("startup").info("UART communication active for automatic operation")
-        except ImportError:
-            pass  # Legacy integration not available
+
+    # ACTJv20(RJSR) Legacy Integration - startup sequence
+    try:
+        from actj_legacy_integration import get_legacy_integration, is_legacy_mode
+        if is_legacy_mode():
+            legacy = get_legacy_integration()
+            legacy.startup_sequence()
+            logging.getLogger("startup").info("ACTJv20(RJSR) legacy startup sequence completed")
+            logging.getLogger("startup").info("UART communication active for automatic operation")
+    except ImportError:
+        pass  # Legacy integration not available
+    except Exception as exc:
+        logging.getLogger("startup").warning("ACTJv20 legacy startup failed: %s", exc)
     
     app_reference = {}
 
