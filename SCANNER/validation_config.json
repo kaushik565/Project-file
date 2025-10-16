@@ -1,0 +1,29 @@
+{
+    "matrix_validation": {
+        "min_length": 8,
+        "max_length": 20,
+        "allowed_prefixes": ["M", "MX", "MAT"],
+        "pattern": "^(M|MX|MAT)[A-Z0-9]+$",
+        "required_sections": 2
+    },
+    "cartridge_validation": {
+        "min_length": 10,
+        "max_length": 25,
+        "allowed_prefixes": ["C", "CAR", "CART"],
+        "pattern": "^[A-Z0-9]{10,25}$",
+        "checksum_enabled": true,
+        "date_validation": true,
+        "lot_validation": true
+    },
+    "general_validation": {
+        "allowed_chars": "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_",
+        "forbidden_sequences": ["00000", "11111", "AAAAA", "XXXXX"],
+        "min_unique_chars": 3
+    },
+    "custom_rules": {
+        "enable_custom_validation": false,
+        "custom_patterns": [],
+        "whitelist_codes": [],
+        "blacklist_codes": []
+    }
+}
