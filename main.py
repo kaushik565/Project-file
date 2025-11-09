@@ -471,6 +471,31 @@ class BatchScannerApp:
         self.awaiting_hardware = False
         self._controller_timeout_id = None
         self._manual_scan_timeout_id = None
+        self.legacy_mode = False
+        self.legacy_integration = None
+        self.legacy_uart_protocol = None
+
+        # Detect legacy mode and prepare UART integration callbacks if available
+        try:
+            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
+
+            if is_legacy_mode():
+                self.legacy_mode = True
+                self.legacy_integration = get_legacy_integration()
+                self.legacy_uart_protocol = getattr(self.legacy_integration, "uart_protocol", None)
+
+                if (
+                    self.legacy_uart_protocol
+                    and hasattr(self.legacy_uart_protocol, "set_scan_request_callback")
+                ):
+
+                    def _legacy_callback(final_attempt: bool) -> None:
+                        # Ensure UI operations happen on Tkinter main thread
+                        self.window.after(0, self._on_legacy_scan_request, final_attempt)
+
+                    self.legacy_uart_protocol.set_scan_request_callback(_legacy_callback)
+        except ImportError:
+            pass
         
         # Initialize camera QR scanner
         self.camera_scanner = None
@@ -489,16 +514,21 @@ class BatchScannerApp:
             except Exception as exc:
                 logging.getLogger("hardware").warning("Unable to assert busy line: %s", exc)
 
-        try:
-            self.controller_link = ControllerLink(
-                self.hardware,
-                self.window,
-                self._handle_controller_request,
-                on_link_down=self._on_controller_link_down,
+        if self.legacy_mode:
+            logging.getLogger("actj.sync").info(
+                "ACTJv20 legacy mode detected; skipping modern controller link initialisation"
             )
-        except Exception as exc:  # pragma: no cover - defensive guard
-            logging.getLogger("actj.sync").exception("Controller link setup failed: %s", exc)
-            self.controller_link = None
+        else:
+            try:
+                self.controller_link = ControllerLink(
+                    self.hardware,
+                    self.window,
+                    self._handle_controller_request,
+                    on_link_down=self._on_controller_link_down,
+                )
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logging.getLogger("actj.sync").exception("Controller link setup failed: %s", exc)
+                self.controller_link = None
 
     # (Stacker sensor and LCD messaging handled by PLC/PIC only)
     
@@ -1047,7 +1077,7 @@ class BatchScannerApp:
     # ---------------- Controller Sync ----------------
     def _handle_controller_request(self, final_attempt: bool) -> None:
         """
-        Handle scan request from firmware. 
+        Handle scan request from firmware.
         Firmware timing: cartridge is positioned and held by pins, ready for QR scan.
         """
         logger = logging.getLogger("actj.sync")
@@ -1079,6 +1109,35 @@ class BatchScannerApp:
 
         # Allow BUSY_SETTLE_MS for hardware to settle before QR scan
         self.window.after(BUSY_SETTLE_MS, self._start_qr_scan_sequence)
+
+    def _on_legacy_scan_request(self, final_attempt: bool) -> None:
+        """Prepare the UI when the legacy ACTJv20 firmware requests a scan."""
+        logger = logging.getLogger("actj.legacy")
+        if not self.scanning_active:
+            logger.warning("Legacy controller requested scan while no batch is active")
+            return
+
+        self.awaiting_hardware = True
+        self._clear_controller_timeout()
+
+        if not self.scan_frame.winfo_manager():
+            self._show_scan()
+
+        detail = f"Cartridge positioned. QR scan {'(final attempt)' if final_attempt else 'requested'}..."
+        self._show_banner("Scanning QR", detail, status_key="READY")
+
+        if hasattr(self, '_manual_scan_timeout_id') and self._manual_scan_timeout_id:
+            self.window.after_cancel(self._manual_scan_timeout_id)
+            self._manual_scan_timeout_id = None
+
+        # Mirror the behaviour of the modern controller: wait briefly before enabling scanners
+        self.window.after(BUSY_SETTLE_MS, self._start_qr_scan_sequence)
+
+        # Fallback timeout so the UI recovers if no QR arrives
+        self._manual_scan_timeout_id = self.window.after(
+            CONTROLLER_RESPONSE_TIMEOUT_MS - 1000,
+            self._on_manual_scan_timeout,
+        )
 
     def _start_qr_scan_sequence(self):
         """
@@ -1589,20 +1648,15 @@ class BatchScannerApp:
         self._reset_scan_state()
         
         # ACTJv20(RJSR) Legacy Integration - Batch Start
-        try:
-            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-            if is_legacy_mode():
-                legacy = get_legacy_integration()
-                # Set batch context for QR validation
-                legacy.set_batch_context(
-                    self.batch_line, 
-                    self.mould_ranges, 
-                    lambda code: self._check_duplicate(code)
-                )
-                legacy.handle_batch_start()
-                logging.getLogger("actj.legacy").info("ACTJv20(RJSR) batch start sequence completed")
-        except ImportError:
-            pass  # Legacy integration not available
+        if self.legacy_mode and self.legacy_integration:
+            legacy = self.legacy_integration
+            legacy.set_batch_context(
+                self.batch_line,
+                self.mould_ranges,
+                lambda code: self._check_duplicate(code)
+            )
+            legacy.handle_batch_start()
+            logging.getLogger("actj.legacy").info("ACTJv20(RJSR) batch start sequence completed")
         
         # Send CMD_START_SCANNING ('B') to PIC to transition it to scanning mode
         # This triggers the firmware to transition from PLC_STATE_SETUP to PLC_STATE_SCANNING
@@ -1639,11 +1693,18 @@ class BatchScannerApp:
         """
         if not self.scanning_active:
             return
-        if not self.awaiting_hardware:
+        legacy_waiting = False
+        if self.legacy_mode and self.legacy_uart_protocol:
+            try:
+                legacy_waiting = bool(self.legacy_uart_protocol.is_waiting_for_qr)
+            except Exception:
+                legacy_waiting = False
+
+        if not self.awaiting_hardware and not legacy_waiting:
             # QR input received but firmware not waiting - ignore
             self.qr_entry.delete(0, tk.END)
             return
-            
+
         qr_code = self.qr_entry.get().strip().upper()
         self.qr_entry.delete(0, tk.END)
         if not qr_code:
@@ -1651,48 +1712,6 @@ class BatchScannerApp:
 
         logger = logging.getLogger("qr.scan")
         logger.info(f"Processing QR from USB/manual input: {qr_code}")
-
-        # ACTJv20(RJSR) Legacy Integration - Process QR via UART protocol
-        try:
-            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-            if is_legacy_mode():
-                legacy = get_legacy_integration()
-                uart_protocol = legacy.uart_protocol
-                if uart_protocol and hasattr(uart_protocol, 'process_qr_input'):
-                    # Send QR to UART protocol for ACTJv20 communication
-                    uart_protocol.process_qr_input(qr_code)
-                    logger.info(f"QR sent to ACTJv20 UART protocol: {qr_code}")
-                    
-                    # Still process locally for display and logging
-                    status, mould = handle_qr_scan(
-                        qr_code,
-                        self.batch_line,
-                        self.mould_ranges,
-                        duplicate_checker=lambda code: self._check_duplicate(code),
-                    )
-                    
-                    # Update local counters and display
-                    if status == "PASS":
-                        self.counters["accepted"] += 1
-                        self.duplicate_tracker.record_scan(self.batch_number, qr_code)
-                        logger.info(f"QR accepted: {qr_code} -> {mould}")
-                    elif status == "DUPLICATE":
-                        self.counters["duplicate"] += 1
-                        logger.warning(f"QR duplicate: {qr_code}")
-                    else:
-                        self.counters["rejected"] += 1
-                        logger.warning(f"QR rejected ({status}): {qr_code}")
-
-                    self.counters["total"] += 1
-                    self._update_scan_display(qr_code, status, mould)
-
-                    if self.csv_writer and self.log_file:
-                        write_log(self.csv_writer, self.log_file, self.batch_number, mould, qr_code, status)
-                    
-                    # Don't call _complete_controller_request - UART protocol handles ACTJv20 response
-                    return
-        except ImportError:
-            pass  # Legacy integration not available
 
         # Cancel manual scan timeout since we got input
         if hasattr(self, '_manual_scan_timeout_id') and self._manual_scan_timeout_id:
@@ -1705,6 +1724,22 @@ class BatchScannerApp:
             self.mould_ranges,
             duplicate_checker=lambda code: self._check_duplicate(code),
         )
+
+        if (
+            self.legacy_mode
+            and legacy_waiting
+            and self.legacy_uart_protocol
+            and hasattr(self.legacy_uart_protocol, "process_qr_input")
+        ):
+            try:
+                self.legacy_uart_protocol.process_qr_input(
+                    qr_code, validation_result=(status, mould)
+                )
+                logger.info("QR result sent to ACTJv20 UART protocol: %s", qr_code)
+            except Exception as exc:
+                logging.getLogger("actj.legacy").error(
+                    "Failed to send QR result to ACTJv20 firmware: %s", exc
+                )
 
         if status == "PASS":
             self.counters["accepted"] += 1
@@ -1722,6 +1757,8 @@ class BatchScannerApp:
 
         if self.csv_writer and self.log_file:
             write_log(self.csv_writer, self.log_file, self.batch_number, mould, qr_code, status)
+
+        self.awaiting_hardware = False
 
         # Send result to firmware - this allows it to set diverter and continue cycle
         self._complete_controller_request(status)
@@ -1771,14 +1808,9 @@ class BatchScannerApp:
         self._abort_pending_controller_request(reason="batch_stop")
         
         # ACTJv20(RJSR) Legacy Integration - Batch End
-        try:
-            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-            if is_legacy_mode():
-                legacy = get_legacy_integration()
-                legacy.handle_batch_end()
-                logging.getLogger("actj.legacy").info("ACTJv20(RJSR) batch end sequence completed")
-        except ImportError:
-            pass  # Legacy integration not available
+        if self.legacy_mode and self.legacy_integration:
+            self.legacy_integration.handle_batch_end()
+            logging.getLogger("actj.legacy").info("ACTJv20(RJSR) batch end sequence completed")
             
         if not self.scanning_active and not self.log_file:
             return
@@ -1860,6 +1892,11 @@ class BatchScannerApp:
             self.controller_link.close()
         if self.camera_scanner:
             self.camera_scanner.close()
+        if self.legacy_mode and self.legacy_integration:
+            try:
+                self.legacy_integration.shutdown_sequence()
+            except Exception as exc:
+                logging.getLogger("actj.legacy").warning("Legacy shutdown sequence failed: %s", exc)
         try:
             self.hardware.set_busy(False)
         except Exception:
@@ -1872,7 +1909,7 @@ def launch_app():
     """Initialize logging and start the Tkinter application."""
     import os
     os.makedirs("batch_logs", exist_ok=True)
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -1881,7 +1918,18 @@ def launch_app():
             logging.FileHandler('batch_logs/jig.log')
         ]
     )
-    
+
+    legacy_mode = False
+    legacy_integration = None
+    try:
+        from actj_legacy_integration import get_legacy_integration, is_legacy_mode
+
+        if is_legacy_mode():
+            legacy_mode = True
+            legacy_integration = get_legacy_integration()
+    except ImportError:
+        pass
+
     # CRITICAL: Assert busy lines HIGH immediately so PIC controller can boot
     # This matches SCANNER hardware initialization pattern
     # This must happen BEFORE any Tkinter UI construction to prevent PIC timeout
@@ -1893,18 +1941,15 @@ def launch_app():
         logging.getLogger("startup").info("All busy/status lines asserted HIGH - PIC can proceed")
     except Exception as exc:
         logging.getLogger("startup").warning("Unable to assert busy lines on startup: %s", exc)
-    
-        # ACTJv20(RJSR) Legacy Integration - startup sequence
+
+    if legacy_mode and legacy_integration:
         try:
-            from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-            if is_legacy_mode():
-                legacy = get_legacy_integration()
-                legacy.startup_sequence()
-                logging.getLogger("startup").info("ACTJv20(RJSR) legacy startup sequence completed")
-                logging.getLogger("startup").info("UART communication active for automatic operation")
-        except ImportError:
-            pass  # Legacy integration not available
-    
+            legacy_integration.startup_sequence()
+            logging.getLogger("startup").info("ACTJv20(RJSR) legacy startup sequence completed")
+            logging.getLogger("startup").info("UART communication active for automatic operation")
+        except Exception as exc:
+            logging.getLogger("startup").warning("Legacy startup sequence failed: %s", exc)
+
     app_reference = {}
 
     def build(window):

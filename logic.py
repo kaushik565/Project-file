@@ -178,63 +178,27 @@ def handle_qr_scan(qr_code, batch_line, mould_ranges, duplicate_checker=None):
     duplicate_checker is an optional callable that receives qr_code and
     returns True if the code has already been scanned for the active batch.
     """
-    # ACTJv20(RJSR) Legacy Integration - Prepare for automatic operation
-    legacy = None
-    try:
-        from actj_legacy_integration import get_legacy_integration, is_legacy_mode
-        if is_legacy_mode():
-            legacy = get_legacy_integration()
-            # Signal to firmware that we're processing QR for automatic operation
-            legacy.prepare_for_qr_scan()
-    except ImportError:
-        pass  # Legacy integration not available
-    
-    try:
-        if not validate_qr_format(qr_code):
-            blink_light("RED")
-            buzz()
-            # Signal FAIL to ACTJv20 for automatic reject
-            if legacy:
-                legacy.handle_fail_result()
-            return "INVALID FORMAT", None
-
-        if qr_code[1] != batch_line:
-            blink_light("RED")
-            buzz()
-            # Signal FAIL to ACTJv20 for automatic reject
-            if legacy:
-                legacy.handle_fail_result()
-            return "LINE MISMATCH", None
-
-        for mould, (start, end) in mould_ranges.items():
-            if start <= qr_code <= end:
-                if duplicate_checker and duplicate_checker(qr_code):
-                    blink_light("YELLOW")
-                    # Signal FAIL to ACTJv20 for automatic reject (duplicate)
-                    if legacy:
-                        legacy.handle_fail_result()
-                    return "DUPLICATE", mould
-                blink_light("GREEN")
-                # Signal PASS to ACTJv20 for automatic advance
-                if legacy:
-                    legacy.handle_pass_result()
-                return "PASS", mould
-
+    if not validate_qr_format(qr_code):
         blink_light("RED")
         buzz()
-        # Signal FAIL to ACTJv20 for automatic reject
-        if legacy:
-            legacy.handle_fail_result()
-        return "OUT OF BATCH", None
-    
-    finally:
-        # ACTJv20(RJSR) Legacy Integration - signal completion
-        try:
-            if legacy:
-                # Signal to firmware that we're done processing QR
-                legacy.complete_qr_scan()
-        except ImportError:
-            pass  # Legacy integration not available
+        return "INVALID FORMAT", None
+
+    if qr_code[1] != batch_line:
+        blink_light("RED")
+        buzz()
+        return "LINE MISMATCH", None
+
+    for mould, (start, end) in mould_ranges.items():
+        if start <= qr_code <= end:
+            if duplicate_checker and duplicate_checker(qr_code):
+                blink_light("YELLOW")
+                return "DUPLICATE", mould
+            blink_light("GREEN")
+            return "PASS", mould
+
+    blink_light("RED")
+    buzz()
+    return "OUT OF BATCH", None
 
 
 # ---------------- CSV Logging ----------------
